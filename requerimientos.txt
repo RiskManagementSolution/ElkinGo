@@ -1,1 +1,5 @@
-Se editará luego
+streamlit
+pandas
+groq
+plotly
+numpy
