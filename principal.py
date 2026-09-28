@@ -14,7 +14,17 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-import anthropic
+import openai
+
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+MODELOS_GROQ = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "moonshotai/kimi-k2-instruct",
+    "qwen/qwen3-32b",
+]
 
 st.set_page_config(page_title="Analisis de Mercados", layout="wide")
 
@@ -129,15 +139,16 @@ with st.sidebar:
     archivo = st.file_uploader("Cargar CSV (formato PBA_4_mercados)", type=["csv"])
     st.caption("Si no cargas un archivo se usan datos de ejemplo.")
 
-    st.header("Asistente de IA")
+    st.header("Asistente de IA (Groq)")
     api_key_input = st.text_input(
-        "Anthropic API key",
+        "Groq API key",
         type="password",
-        value=os.environ.get("ANTHROPIC_API_KEY", ""),
+        value=os.environ.get("GROQ_API_KEY", ""),
         help="Se usa solo en esta sesion, no se guarda en ningun lado. "
-             "Tambien puedes definirla como variable de entorno ANTHROPIC_API_KEY "
+             "Tambien puedes definirla como variable de entorno GROQ_API_KEY "
              "o en .streamlit/secrets.toml.",
     )
+    modelo_sel = st.selectbox("Modelo", MODELOS_GROQ, index=0)
     incluir_datos_completos = st.checkbox(
         "Incluir datos completos filtrados en el contexto",
         value=False,
@@ -288,8 +299,8 @@ pregunta = st.chat_input("Ej: ¿Que mercado tiene el mejor margen promedio?")
 if pregunta:
     if not api_key_input:
         st.error(
-            "Falta la API key de Anthropic. Ingresala en la barra lateral, "
-            "o defina la variable de entorno ANTHROPIC_API_KEY."
+            "Falta la API key de Groq. Ingresala en la barra lateral, "
+            "o defina la variable de entorno GROQ_API_KEY."
         )
     else:
         st.session_state.mensajes.append({"role": "user", "content": pregunta})
@@ -308,27 +319,30 @@ if pregunta:
         )
 
         try:
-            cliente = anthropic.Anthropic(api_key=api_key_input)
+            cliente = openai.OpenAI(api_key=api_key_input, base_url=GROQ_BASE_URL)
             with st.chat_message("assistant"):
                 marcador = st.empty()
                 texto_completo = ""
-                with cliente.messages.stream(
-                    model="claude-sonnet-5",
+                stream = cliente.chat.completions.create(
+                    model=modelo_sel,
                     max_tokens=1024,
-                    system=system_prompt,
-                    messages=[
+                    messages=[{"role": "system", "content": system_prompt}]
+                    + [
                         {"role": m["role"], "content": m["content"]}
                         for m in st.session_state.mensajes
                     ],
-                ) as stream:
-                    for texto in stream.text_stream:
-                        texto_completo += texto
+                    stream=True,
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        texto_completo += delta
                         marcador.markdown(texto_completo + "▌")
                 marcador.markdown(texto_completo)
             st.session_state.mensajes.append(
                 {"role": "assistant", "content": texto_completo}
             )
-        except anthropic.AuthenticationError:
-            st.error("La API key no es valida.")
+        except openai.AuthenticationError:
+            st.error("La API key de Groq no es valida.")
         except Exception as e:
-            st.error(f"Error al llamar a la API de Anthropic: {e}")
+            st.error(f"Error al llamar a la API de Groq: {e}")
