@@ -8,11 +8,13 @@ Ejecutar con:
 """
 
 import io
+import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import anthropic
 
 st.set_page_config(page_title="Analisis de Mercados", layout="wide")
 
@@ -91,6 +93,31 @@ def datos_ejemplo() -> pd.DataFrame:
     return df
 
 
+def construir_contexto(df_filtrado: pd.DataFrame, incluir_todo: bool) -> str:
+    """
+    Arma un texto en Markdown con estadisticas por mercado para dar contexto
+    al modelo. Si incluir_todo=True, adjunta ademas los datos filtrados
+    completos en CSV (mas preciso, mas tokens).
+    """
+    columnas = METRICAS + ["Utilidad Unitaria", "Utilidad Total", "Ingreso Total", "Margen %"]
+    resumen = df_filtrado.groupby("Mercado")[columnas].describe().round(2)
+
+    partes = [
+        f"Rango de dias analizado: {int(df_filtrado['Dia'].min())} a "
+        f"{int(df_filtrado['Dia'].max())}.",
+        f"Mercados incluidos: {', '.join(sorted(df_filtrado['Mercado'].unique()))}.",
+        "Estadisticas descriptivas por mercado (count, mean, std, min, 25%, 50%, "
+        "75%, max):",
+        resumen.to_markdown(),
+    ]
+
+    if incluir_todo:
+        partes.append("Datos completos filtrados (CSV):")
+        partes.append(df_filtrado.to_csv(index=False))
+
+    return "\n\n".join(partes)
+
+
 # ------------------------------------------------------------------
 # Interfaz
 # ------------------------------------------------------------------
@@ -101,6 +128,22 @@ with st.sidebar:
     st.header("Datos")
     archivo = st.file_uploader("Cargar CSV (formato PBA_4_mercados)", type=["csv"])
     st.caption("Si no cargas un archivo se usan datos de ejemplo.")
+
+    st.header("Asistente de IA")
+    api_key_input = st.text_input(
+        "Anthropic API key",
+        type="password",
+        value=os.environ.get("ANTHROPIC_API_KEY", ""),
+        help="Se usa solo en esta sesion, no se guarda en ningun lado. "
+             "Tambien puedes definirla como variable de entorno ANTHROPIC_API_KEY "
+             "o en .streamlit/secrets.toml.",
+    )
+    incluir_datos_completos = st.checkbox(
+        "Incluir datos completos filtrados en el contexto",
+        value=False,
+        help="Mas preciso para preguntas puntuales, pero consume mas tokens (y "
+             "cuesta mas) por pregunta.",
+    )
 
 if archivo is not None:
     try:
@@ -222,3 +265,70 @@ st.download_button(
     file_name="mercados_procesado.csv",
     mime="text/csv",
 )
+
+# ------------------------------------------------------------------
+# Asistente de IA (chat sobre los datos filtrados)
+# ------------------------------------------------------------------
+st.divider()
+st.subheader("💬 Preguntale a la IA sobre estos datos")
+st.caption(
+    "El asistente responde con base en las estadisticas del recorte actual "
+    "(mercados y rango de dias elegidos en la barra lateral)."
+)
+
+if "mensajes" not in st.session_state:
+    st.session_state.mensajes = []
+
+for m in st.session_state.mensajes:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+pregunta = st.chat_input("Ej: ¿Que mercado tiene el mejor margen promedio?")
+
+if pregunta:
+    if not api_key_input:
+        st.error(
+            "Falta la API key de Anthropic. Ingresala en la barra lateral, "
+            "o defina la variable de entorno ANTHROPIC_API_KEY."
+        )
+    else:
+        st.session_state.mensajes.append({"role": "user", "content": pregunta})
+        with st.chat_message("user"):
+            st.markdown(pregunta)
+
+        contexto = construir_contexto(df_f, incluir_datos_completos)
+        system_prompt = (
+            "Eres un analista de datos que ayuda a interpretar un dataset de "
+            "precios, cantidades y costos de varios mercados. Responde en "
+            "español, de forma clara y concisa, basandote unicamente en el "
+            "contexto entregado. Si la pregunta requiere un dato exacto que no "
+            "esta en el resumen (y no se incluyeron los datos completos), dilo "
+            "explicitamente en vez de inventar numeros.\n\n"
+            f"CONTEXTO DE DATOS:\n{contexto}"
+        )
+
+        try:
+            cliente = anthropic.Anthropic(api_key=api_key_input)
+            with st.chat_message("assistant"):
+                marcador = st.empty()
+                texto_completo = ""
+                with cliente.messages.stream(
+                    model="claude-sonnet-5",
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=[
+                        {"role": m["role"], "content": m["content"]}
+                        for m in st.session_state.mensajes
+                    ],
+                ) as stream:
+                    for texto in stream.text_stream:
+                        texto_completo += texto
+                        marcador.markdown(texto_completo + "▌")
+                marcador.markdown(texto_completo)
+            st.session_state.mensajes.append(
+                {"role": "assistant", "content": texto_completo}
+            )
+        except anthropic.AuthenticationError:
+            st.error("La API key no es valida.")
+        except Exception as e:
+            st.error(f"Error al llamar a la API de Anthropic: {e}")
