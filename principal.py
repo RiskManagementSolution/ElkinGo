@@ -103,29 +103,54 @@ def datos_ejemplo() -> pd.DataFrame:
     return df
 
 
-def construir_contexto(df_filtrado: pd.DataFrame, incluir_todo: bool) -> str:
-    """
-    Arma un texto en Markdown con estadisticas por mercado para dar contexto
-    al modelo. Si incluir_todo=True, adjunta ademas los datos filtrados
-    completos en CSV (mas preciso, mas tokens).
-    """
-    columnas = METRICAS + ["Utilidad Unitaria", "Utilidad Total", "Ingreso Total", "Margen %"]
-    resumen = df_filtrado.groupby("Mercado")[columnas].describe().round(2)
+def estimar_tokens(texto: str) -> int:
+    """Aproximacion rapida: ~4 caracteres por token."""
+    return len(texto) // 4
 
-    partes = [
-        f"Rango de dias analizado: {int(df_filtrado['Dia'].min())} a "
-        f"{int(df_filtrado['Dia'].max())}.",
-        f"Mercados incluidos: {', '.join(sorted(df_filtrado['Mercado'].unique()))}.",
-        "Estadisticas descriptivas por mercado (count, mean, std, min, 25%, 50%, "
-        "75%, max):",
-        resumen.to_markdown(),
+
+def construir_contexto(
+    df_filtrado: pd.DataFrame, incluir_todo: bool, max_tokens_contexto: int = 2500
+) -> str:
+    """
+    Arma un texto compacto (no describe() completo, que es muy verboso) con
+    mean/std/min/max por mercado. Si incluir_todo=True intenta adjuntar los
+    datos filtrados completos en CSV, mostrando una muestra si no caben en
+    el presupuesto de tokens.
+    """
+    columnas = ["Precio de Venta", "Cantidad producida & vendida",
+                "Costo unitario", "Utilidad Total", "Margen %"]
+
+    lineas = [
+        f"Rango de dias: {int(df_filtrado['Dia'].min())} a {int(df_filtrado['Dia'].max())}.",
+        f"Mercados: {', '.join(sorted(df_filtrado['Mercado'].unique()))}.",
+        "Estadisticas por mercado (media | desv.est | min | max):",
     ]
+    for mercado, grupo in df_filtrado.groupby("Mercado"):
+        partes_mercado = [mercado]
+        for col in columnas:
+            s = grupo[col]
+            partes_mercado.append(
+                f"{col}: {s.mean():.2f}|{s.std():.2f}|{s.min():.2f}|{s.max():.2f}"
+            )
+        lineas.append(" — ".join(partes_mercado))
+
+    contexto = "\n".join(lineas)
 
     if incluir_todo:
-        partes.append("Datos completos filtrados (CSV):")
-        partes.append(df_filtrado.to_csv(index=False))
+        csv_completo = df_filtrado.to_csv(index=False)
+        presupuesto_csv = max_tokens_contexto - estimar_tokens(contexto) - 100
+        if estimar_tokens(csv_completo) > presupuesto_csv:
+            # No cabe completo: se recorta a una muestra y se avisa al modelo
+            max_chars = max(presupuesto_csv * 4, 0)
+            csv_recortado = csv_completo[:max_chars]
+            contexto += (
+                "\n\nMuestra parcial de los datos filtrados (se recorto por "
+                "limite de tamaño, no son todos los registros):\n" + csv_recortado
+            )
+        else:
+            contexto += "\n\nDatos completos filtrados (CSV):\n" + csv_completo
 
-    return "\n\n".join(partes)
+    return contexto
 
 
 # ------------------------------------------------------------------
@@ -152,8 +177,9 @@ with st.sidebar:
     incluir_datos_completos = st.checkbox(
         "Incluir datos completos filtrados en el contexto",
         value=False,
-        help="Mas preciso para preguntas puntuales, pero consume mas tokens (y "
-             "cuesta mas) por pregunta.",
+        help="Mas preciso para preguntas puntuales, pero consume mas tokens. "
+             "Si no caben en el limite de tokens por minuto de tu cuenta de "
+             "Groq, se envia automaticamente una muestra parcial.",
     )
 
 if archivo is not None:
@@ -344,5 +370,13 @@ if pregunta:
             )
         except openai.AuthenticationError:
             st.error("La API key de Groq no es valida.")
+        except openai.RateLimitError as e:
+            st.error(
+                "Se supero el limite de tokens por minuto de tu cuenta de Groq "
+                f"para el modelo `{modelo_sel}`. Prueba con un modelo con mayor "
+                "limite (ej. llama-3.1-8b-instant o llama-3.3-70b-versatile), "
+                "desactiva 'Incluir datos completos', o reduce el rango de "
+                f"dias/mercados en los filtros.\n\nDetalle: {e}"
+            )
         except Exception as e:
             st.error(f"Error al llamar a la API de Groq: {e}")
